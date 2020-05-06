@@ -536,151 +536,149 @@ func isFresh(cacheCC, reqCC *cacheControl, lastModified time.Time) bool {
 	return freshCache && freshReq
 }
 
-func cacheHandler(next http.HandlerFunc, w http.ResponseWriter, r *http.Request, b *Backend) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		clnt := b.cacheClient
-		if clnt == nil || !clnt.isCacheable(r.Method) || !clnt.up {
-			next.ServeHTTP(w, r)
+func cacheHandler(w http.ResponseWriter, r *http.Request, b *Backend) {
+	clnt := b.cacheClient
+	if clnt == nil || !clnt.isCacheable(r.Method) || !clnt.up {
+		b.proxy.ServeHTTP(w, r)
+		return
+	}
+
+	sortURLParams(r.URL)
+	key := generateKey(r.URL, r.Host)
+	coreClient := minio.Core{Client: clnt.api}
+	var opts minio.GetObjectOptions
+	for k, v := range r.Header {
+		opts.Set(k, strings.Join(v, ""))
+	}
+
+	reader, oi, _, cacheErr := coreClient.GetObject(clnt.bucket, key, opts)
+	cacheHdrs := getCacheResponseHeaders(oi)
+	cc := parseCacheControlHeaders(cacheHdrs.Header)
+	reqCC := parseCacheControlHeaders(r.Header)
+	serveCache := false
+	if cacheErr == nil {
+		// write response headers and response output return
+		defer reader.Close()
+		if reqCC.neverCache() {
+			// for expired content, revert to backend and clear cache.
+			b.proxy.ServeHTTP(w, r)
 			return
 		}
-
-		sortURLParams(r.URL)
-		key := generateKey(r.URL, r.Host)
-		coreClient := minio.Core{Client: clnt.api}
-		var opts minio.GetObjectOptions
-		for k, v := range r.Header {
-			opts.Set(k, strings.Join(v, ""))
-		}
-
-		reader, oi, _, cacheErr := coreClient.GetObject(clnt.bucket, key, opts)
-		cacheHdrs := getCacheResponseHeaders(oi)
-		cc := parseCacheControlHeaders(cacheHdrs.Header)
-		reqCC := parseCacheControlHeaders(r.Header)
-		serveCache := false
-		if cacheErr == nil {
-			// write response headers and response output return
-			defer reader.Close()
-			if reqCC.neverCache() {
-				// for expired content, revert to backend and clear cache.
-				next.ServeHTTP(w, r)
-				return
+		serveCache = isFresh(cc, reqCC, cacheHdrs.LastModified())
+		if !serveCache {
+			// set cache headers for ETag and LastModified verification
+			if r.Header.Get(xhttp.ETag) == "" && cacheHdrs.ETag() != "" {
+				r.Header.Set(xhttp.IfNoneMatch, cacheHdrs.ETag())
 			}
-			serveCache = isFresh(cc, reqCC, cacheHdrs.LastModified())
-			if !serveCache {
-				// set cache headers for ETag and LastModified verification
-				if r.Header.Get(xhttp.ETag) == "" && cacheHdrs.ETag() != "" {
-					r.Header.Set(xhttp.IfNoneMatch, cacheHdrs.ETag())
-				}
-				if r.Header.Get(xhttp.LastModified) == "" && !cacheHdrs.LastModified().IsZero() {
-					r.Header.Set(xhttp.IfModifiedSince, cacheHdrs.LastModified().UTC().Format(http.TimeFormat))
-				}
+			if r.Header.Get(xhttp.LastModified) == "" && !cacheHdrs.LastModified().IsZero() {
+				r.Header.Set(xhttp.IfModifiedSince, cacheHdrs.LastModified().UTC().Format(http.TimeFormat))
 			}
 		}
-		if r.Method == http.MethodHead {
-			if cacheErr != nil || !serveCache {
-				next.ServeHTTP(w, r)
+	}
+	if r.Method == http.MethodHead {
+		if cacheErr != nil || !serveCache {
+			b.proxy.ServeHTTP(w, r)
+			return
+		}
+		for k, v := range cacheHdrs.Header {
+			w.Header().Set(k, strings.Join(v, ","))
+		}
+		if cacheHdrs.Range() != nil {
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
+		return
+	}
+	var result *http.Response
+	var rec *httptest.ResponseRecorder
+	if r.Method == http.MethodGet {
+		// either no cached entry or cache entry requires revalidation
+		if !serveCache {
+			rec = httptest.NewRecorder()
+			b.proxy.ServeHTTP(rec, r)
+			result = rec.Result()
+			statusCode := result.StatusCode
+			if cacheErr != nil && reqCC != nil && reqCC.onlyIfCached {
+				// need to issue a gateway timeout response here.
+				w.WriteHeader(http.StatusGatewayTimeout)
 				return
 			}
-			for k, v := range cacheHdrs.Header {
-				w.Header().Set(k, strings.Join(v, ","))
+			if statusCode == http.StatusNotModified {
+				// add end to headers to cache response headers
+				// serve from cache
+				serveCache = true
+				endHdrs := getEndToEndHeaders(result.Header)
+				for k, v := range endHdrs {
+					cacheHdrs.Header[k] = v
+				}
+			} else if statusCode != http.StatusOK {
+				go func() {
+					clnt.api.RemoveObject(clnt.bucket, key)
+				}()
+				// write backend response and return
 			}
+		}
+		if serveCache {
+			// serve cache entry
+			setRespHeaders(w, cacheHdrs.Header)
+			statusCodeWritten := false
 			if cacheHdrs.Range() != nil {
 				w.WriteHeader(http.StatusPartialContent)
-			} else {
-				w.WriteHeader(http.StatusOK)
 			}
-			return
-		}
-		var result *http.Response
-		var rec *httptest.ResponseRecorder
-		if r.Method == http.MethodGet {
-			// either no cached entry or cache entry requires revalidation
-			if !serveCache {
-				rec = httptest.NewRecorder()
-				next.ServeHTTP(rec, r)
-				result = rec.Result()
-				statusCode := result.StatusCode
-				if cacheErr != nil && reqCC != nil && reqCC.onlyIfCached {
-					// need to issue a gateway timeout response here.
-					w.WriteHeader(http.StatusGatewayTimeout)
-					return
-				}
-				if statusCode == http.StatusNotModified {
-					// add end to headers to cache response headers
-					// serve from cache
-					serveCache = true
-					endHdrs := getEndToEndHeaders(result.Header)
-					for k, v := range endHdrs {
-						cacheHdrs.Header[k] = v
-					}
-				} else if statusCode != http.StatusOK {
-					go func() {
-						clnt.api.RemoveObject(clnt.bucket, key)
-					}()
-					// write backend response and return
-				}
-			}
-			if serveCache {
-				// serve cache entry
-				setRespHeaders(w, cacheHdrs.Header)
-				statusCodeWritten := false
-				if cacheHdrs.Range() != nil {
-					w.WriteHeader(http.StatusPartialContent)
-				}
-				httpWriter := xioutil.WriteOnClose(w)
-				// Write object content to response body
-				if _, err := io.Copy(httpWriter, reader); err != nil {
-					if !httpWriter.HasWritten() && !statusCodeWritten { // write error response only if no data or headers has been written to client yet
-						next.ServeHTTP(w, r)
-					}
-					return
-				}
-
-				if err := httpWriter.Close(); err != nil {
-					if !httpWriter.HasWritten() && !statusCodeWritten { // write error response only if no data or headers has been written to client yet
-						next.ServeHTTP(w, r)
-						return
-					}
-				}
-				return
-			}
-			for k, v := range result.Header {
-				w.Header().Set(k, strings.Join(v, ","))
-			}
-			value := rec.Body.Bytes()
-			statusCode := result.StatusCode
-			w.WriteHeader(statusCode)
-			w.Write(value)
-			respCC := parseCacheControlHeaders(result.Header)
-			if respCC.neverCache() || len(value) < int(clnt.minSize) {
-				if cacheErr == nil {
-					go func() {
-						clnt.api.RemoveObject(clnt.bucket, key)
-					}()
-				}
-				return
-			}
-			rs := result.Header.Get(xhttp.ContentRange)
-			if rs != "" {
-				// Avoid caching range GET's for now.
-				if cacheErr == nil {
-					go func() {
-						clnt.api.RemoveObject(clnt.bucket, key)
-					}()
+			httpWriter := xioutil.WriteOnClose(w)
+			// Write object content to response body
+			if _, err := io.Copy(httpWriter, reader); err != nil {
+				if !httpWriter.HasWritten() && !statusCodeWritten { // write error response only if no data or headers has been written to client yet
+					b.proxy.ServeHTTP(w, r)
 				}
 				return
 			}
 
-			go func() {
-				opts := getPutOpts(result.Header)
-				_, err := clnt.api.PutObject(clnt.bucket, key, bytes.NewReader(value), int64(len(value)), opts)
-				if err != nil {
-					clnt.up = false
-					logger.LogIf(context.Background(), err, "Failed to cache object")
+			if err := httpWriter.Close(); err != nil {
+				if !httpWriter.HasWritten() && !statusCodeWritten { // write error response only if no data or headers has been written to client yet
+					b.proxy.ServeHTTP(w, r)
+					return
 				}
-			}()
+			}
 			return
 		}
+		for k, v := range result.Header {
+			w.Header().Set(k, strings.Join(v, ","))
+		}
+		value := rec.Body.Bytes()
+		statusCode := result.StatusCode
+		w.WriteHeader(statusCode)
+		w.Write(value)
+		respCC := parseCacheControlHeaders(result.Header)
+		if respCC.neverCache() || len(value) < int(clnt.minSize) {
+			if cacheErr == nil {
+				go func() {
+					clnt.api.RemoveObject(clnt.bucket, key)
+				}()
+			}
+			return
+		}
+		rs := result.Header.Get(xhttp.ContentRange)
+		if rs != "" {
+			// Avoid caching range GET's for now.
+			if cacheErr == nil {
+				go func() {
+					clnt.api.RemoveObject(clnt.bucket, key)
+				}()
+			}
+			return
+		}
+
+		go func() {
+			opts := getPutOpts(result.Header)
+			_, err := clnt.api.PutObject(clnt.bucket, key, bytes.NewReader(value), int64(len(value)), opts)
+			if err != nil {
+				clnt.up = false
+				logger.LogIf(context.Background(), err, "Failed to cache object")
+			}
+		}()
+		return
 	}
 }
 
